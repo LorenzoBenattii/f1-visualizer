@@ -16,6 +16,80 @@ class TrackRenderer:
 
         self.circuit_info = self.session.get_circuit_info()
 
+        self.driver_cache = {}
+        self.cache_driver_positions()
+
+    def init_drivers(self, ax):
+        track_angle = self.circuit_info.rotation / 180 * np.pi
+
+        self.driver_artists = {}
+
+        for driver_code, pos_data in self.driver_cache.items():
+
+            
+            point = ax.scatter([], [], s=80)
+
+            label = ax.text(0, 0, driver_code, fontsize=8, ha="center")
+
+            self.driver_artists[driver_code] = {
+                "point": point,
+                "label": label,
+                "data": pos_data
+            }
+
+    def interpolate_position(self, pos_data, session_time):
+
+        times = pos_data["Time"].values
+
+        index = np.searchsorted(times, session_time)
+
+        # outside telemetry range
+        if index == 0 or index >= len(times):
+            return None, None
+
+        t1 = times[index - 1]
+        t2 = times[index]
+
+        x1 = pos_data.iloc[index - 1]["X"]
+        y1 = pos_data.iloc[index - 1]["Y"]
+
+        x2 = pos_data.iloc[index]["X"]
+        y2 = pos_data.iloc[index]["Y"]
+
+        # interpolation factor
+        ratio = (session_time - t1) / (t2 - t1)
+
+        x = x1 + ratio * (x2 - x1)
+        y = y1 + ratio * (y2 - y1)
+
+        return x, y
+
+    def cache_driver_positions(self) -> None:
+        for _, driver in self.session.results.iterrows():
+            driver_code = driver["Abbreviation"]
+
+            laps = self.session.laps.pick_drivers(driver_code)
+
+            if laps.empty:
+                continue
+
+            telemetry = []
+
+            for _, lap in laps.iterrows():
+                pos_data = lap.get_pos_data()
+
+                if pos_data.empty:
+                    continue
+                
+                pos_data = pos_data[["SessionTime", "X", "Y"]].copy()
+
+                pos_data["Time"] = (pos_data["SessionTime"].dt.total_seconds())
+
+                telemetry.append(pos_data)
+
+            if telemetry:
+                self.driver_cache[driver_code] = pd.concat(telemetry, ignore_index=True)
+
     def rotate(self, xy, *, angle):
         rotation_matrix = np.array([[np.cos(angle), np.sin(angle)],
                                     [-np.sin(angle), np.cos(angle)]])
@@ -77,80 +151,47 @@ class TrackRenderer:
                 color="white"
             )
 
-    def draw_drivers(self, ax, session_time: float):
+    def update_drivers(self, session_time):
+
         track_angle = self.circuit_info.rotation / 180 * np.pi
-        drivers = []
-        
-        for _, driver in self.session.results.iterrows():
-            driver_code = driver["Abbreviation"]
-            laps = self.session.laps.pick_drivers(driver_code)
-            if laps.empty:
+        for driver_code, artist in self.driver_artists.items():
+
+            pos_data = artist["data"]
+
+            x, y = self.interpolate_position(pos_data, session_time)
+
+            if x is None:
                 continue
-
-            target_time = pd.to_timedelta(session_time, unit="s")
-
-            active_lap = laps[
-                (laps["LapStartTime"] <= target_time) &
-                (laps["LapStartTime"] + laps["LapTime"] >= target_time)
-            ]
-
-            if active_lap.empty:
-                continue
-
-            lap = active_lap.iloc[0]
-
-            
-            pos_data = lap.get_pos_data()
-            
-
-            telemetry_time = (pos_data["SessionTime"].dt.total_seconds())
-
-            idx = (telemetry_time - session_time).abs().idxmin()
-
-            x = pos_data.loc[idx, "X"]
-            y = pos_data.loc[idx, "Y"]
 
             x, y = self.rotate([x, y], angle=track_angle)
 
-            point = ax.scatter(x, y, s=80)
+            # move car
+            artist["point"].set_offsets([[x, y]])
 
-            ax.text(x, y, driver_code, fontsize=8)
+            # move name
+            artist["label"].set_position((x, y))
+        
+    def draw(self):
 
-            drivers.append(point)
-
-        return drivers
-    
-    def draw(self, speed: int) -> None:
         plt.ion()
 
         fig, ax = plt.subplots()
 
         self.draw_track(ax)
+        self.init_drivers(ax)
 
         ax.set_title(self.session.event["Location"])
         ax.set_xticks([])
         ax.set_yticks([])
         ax.axis("equal")
 
-        drivers = None
+        times = sorted(set(np.concatenate([data["Time"].values for data in self.driver_cache.values()])))
 
-        t = 1
+        for t in times:
 
-        while True:
-
-            # remove previous car positions
-            if drivers:
-                for d in drivers:
-                    d.remove()
-
-            drivers = self.draw_drivers(
-                ax,
-                t * speed
-            )
+            self.update_drivers(t)
 
             fig.canvas.draw()
             fig.canvas.flush_events()
 
-            plt.pause(1)
-
-            t += 1
+            plt.pause(0.05)
